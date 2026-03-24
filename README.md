@@ -141,21 +141,6 @@ A fresh pipeline is then retrained from scratch on this augmented dataset (TF-ID
 
 ---
 
-## Post-competition improvements
-
-After the competition closed, two further changes were tested:
-
-**Soft-voting ensemble** (`active_model = "ensemble"`): replacing the single LightGBM with a `VotingClassifier(voting='soft')` combining LGBM + XGBoost + CalibratedLinearSVC. The three members fail on different examples (trees struggle on sparse TF-IDF; LinearSVC excels there), so their averaged probabilities are better calibrated than any individual model.
-
-**Sentence Transformer embeddings**: replacing GloVe mean-pooling with `all-MiniLM-L6-v2` from `sentence-transformers`. Unlike GloVe (static per-word vectors), MiniLM encodes the full sentence context — distinguishing `"Furthermore, this demonstrates..."` from a human typo with the same tokens. The model is frozen during inference (no fine-tuning), so it adds zero variance despite its 22M parameters.
-
-| Version | Embedding | Active model | Macro F1 |
-|---|---|---|---|
-| Competition submission | GloVe 100-dim | `lgbm` | **0.916** |
-| Post-competition | Sentence Transformer MiniLM | `ensemble` | **0.925** |
-
----
-
 ## Repository Structure
 
 ```
@@ -163,6 +148,11 @@ After the competition closed, two further changes were tested:
 ├── dataset/
 │   ├── train.csv        # 2,400 labelled samples (TEXT, LABEL)
 │   └── test.csv         # 600 unlabelled samples (TEXT)
+├── utils/
+│   ├── PretrainedEmbedder.py
+│   ├── ScalarTextFeatureExtractor.py
+│   ├── TfidfCharSelector.py
+│   ├── TfidfImpChiSelector.py        
 ├── submission.csv       # Final predictions (0.916)
 └── README.md
 ```
