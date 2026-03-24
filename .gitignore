@@ -1,0 +1,5 @@
+README_private_notes.md
+.gitignore
+.DS_Store
+__pycache__/
+main_v5_big_model_0925.py
