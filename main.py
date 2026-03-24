@@ -46,502 +46,19 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.metrics import classification_report, f1_score
 
-np.random.seed(42)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. SCALAR FEATURE EXTRACTOR
-#    Derives handcrafted numeric signals that distinguish human vs. AI writing.
-#    Key insight: human text has higher error rates, more variance in sentence
-#    length, and lower "AI tells" (formal transitions, uniform structure).
-# ══════════════════════════════════════════════════════════════════════════════
-
-class ScalarTextFeatureExtractor(BaseEstimator, TransformerMixin):
-    """
-    Extracts numeric (scalar) features from a raw text column.
-
-    Designed to capture stylometric signals that correlate with whether a text
-    was written by a human or an AI model:
-
-    - Structural: length, word count, sentence count, paragraph hints
-    - Lexical: type-token ratio (diversity), avg word length
-    - Error signals: doubled chars, excessive punctuation runs, ALLCAPS words
-    - AI "tells": frequency of formal discourse markers (Furthermore, Indeed…)
-    - Punctuation & spacing patterns
-
-    Parameters
-    ----------
-    text_col : str
-        Name of the text column in the input DataFrame. Default ``"TEXT"``.
-    """
-
-    # High-confidence AI discourse markers (formal connectives rarely used by
-    # casual human writers, especially student essayists with typos)
-    _AI_MARKERS: List[str] = [
-        r"\bfurthermore\b",
-        r"\bmoreover\b",
-        r"\bin conclusion\b",
-        r"\bnotably\b",
-        r"\bit is worth noting\b",
-        r"\bit is important to note\b",
-        r"\bin summary\b",
-        r"\bto summarize\b",
-        r"\bin essence\b",
-        r"\bthis underscores\b",
-        r"\bthis highlights\b",
-        r"\bultimately\b",
-        r"\bthis demonstrates\b",
-        r"\boverall\b",
-    ]
-
-    def __init__(self, text_col: str = "TEXT") -> None:
-        self.text_col = text_col
-
-    # ------------------------------------------------------------------
-    # sklearn API — fit is a no-op (all features are unsupervised stats)
-    # ------------------------------------------------------------------
-    def fit(self, X: pd.DataFrame, y=None) -> "ScalarTextFeatureExtractor":
-        return self
-
-    def transform(self, X: pd.DataFrame) -> np.ndarray:
-        """
-        Returns a 2-D float array of shape (n_samples, n_features).
-
-        All features are computed on the raw text string, preserving original
-        casing and spacing so that error-signal features remain intact.
-        """
-        texts: pd.Series = X[self.text_col].fillna("").astype(str)
-        frames: List[pd.Series] = []
-
-        # ── 1. Basic length / count features ─────────────────────────────────
-        frames.append(texts.str.len().rename("char_len"))
-        word_counts = texts.str.split().str.len().fillna(0)
-        frames.append(word_counts.rename("word_count"))
-
-        # Sentence count: split on [.!?] followed by whitespace or end-of-str
-        sent_counts = texts.apply(
-            lambda t: max(1, len(re.split(r"[.!?]+\s+|[.!?]+$", t.strip())))
-        )
-        frames.append(sent_counts.rename("sentence_count"))
-        frames.append((word_counts / sent_counts).rename("words_per_sentence"))
-
-        # ── 2. Lexical richness ───────────────────────────────────────────────
-        def _ttr(text: str) -> float:
-            """Type-Token Ratio: unique_words / total_words (capped at 1.0)."""
-            tokens = text.lower().split()
-            if not tokens:
-                return 0.0
-            return min(len(set(tokens)) / len(tokens), 1.0)
-
-        frames.append(texts.apply(_ttr).rename("type_token_ratio"))
-
-        def _avg_word_len(text: str) -> float:
-            words = text.split()
-            if not words:
-                return 0.0
-            return np.mean([len(w) for w in words])
-
-        frames.append(texts.apply(_avg_word_len).rename("avg_word_len"))
-
-        # ── 3. Sentence-length variance (AI text is more uniform) ─────────────
-        def _sent_len_std(text: str) -> float:
-            sents = re.split(r"[.!?]+\s+|[.!?]+$", text.strip())
-            lens = [len(s.split()) for s in sents if s.strip()]
-            return float(np.std(lens)) if len(lens) > 1 else 0.0
-
-        frames.append(texts.apply(_sent_len_std).rename("sent_len_std"))
-
-        # ── 4. Punctuation & special-char ratios ──────────────────────────────
-        char_len = texts.str.len().replace(0, 1)  # avoid /0
-
-        punct_count = texts.apply(
-            lambda t: sum(1 for c in t if c in string.punctuation)
-        )
-        frames.append((punct_count / char_len).rename("punct_ratio"))
-
-        comma_count = texts.str.count(",")
-        frames.append((comma_count / (word_counts + 1)).rename("comma_per_word"))
-
-        # Exclamation and question marks (human emotion signals)
-        frames.append(texts.str.count(r"!").rename("exclamation_count"))
-        frames.append(texts.str.count(r"\?").rename("question_count"))
-
-        # ── 5. Capitalisation patterns ────────────────────────────────────────
-        # ALL-CAPS words (e.g. "I WAS ESPECIALLY DELIGHTED" in label-1 sample)
-        frames.append(
-            texts.apply(
-                lambda t: sum(1 for w in t.split() if w.isupper() and len(w) > 1)
-            ).rename("allcaps_word_count")
-        )
-
-        # Ratio of uppercase characters overall
-        frames.append(
-            texts.apply(
-                lambda t: sum(1 for c in t if c.isupper()) / max(len(t), 1)
-            ).rename("uppercase_char_ratio")
-        )
-
-        # ── 6. Typo / error signals (human fingerprints) ─────────────────────
-        # Doubled consonants that look like typos (e.g. "aboliished", "iis")
-        frames.append(
-            texts.str.count(r"([b-df-hj-np-tv-z])\1{2,}").rename("triple_consonant_count")
-        )
-
-        # Runs of repeated non-space characters ≥ 3 (e.g. "!!!!", "???")
-        frames.append(
-            texts.str.count(r"(.)\1{2,}").rename("char_repeat_run_count")
-        )
-
-        # Words with internal digit-letter mix or abnormal apostrophe (typos)
-        frames.append(
-            texts.apply(
-                lambda t: sum(
-                    1 for w in t.split()
-                    if re.search(r"[a-z][0-9]|[0-9][a-z]", w.lower())
-                )
-            ).rename("alphanum_mix_count")
-        )
-
-        # ── 7. AI discourse markers ───────────────────────────────────────────
-        ai_marker_total = sum(
-            texts.str.count(pattern, flags=re.IGNORECASE)
-            for pattern in self._AI_MARKERS
-        )
-        frames.append(ai_marker_total.rename("ai_marker_count"))
-
-        # Each marker gets its own binary presence flag for granularity
-        for pattern in self._AI_MARKERS:
-            name = re.sub(r"\\b|[^a-z_]", "", pattern).strip("_")
-            frames.append(
-                texts.str.contains(pattern, flags=re.IGNORECASE, regex=True)
-                .astype(int)
-                .rename(f"marker_{name}")
-            )
-
-        # ── 8. Digit / number count ───────────────────────────────────────────
-        frames.append(texts.str.count(r"\d+").rename("digit_group_count"))
-
-        # ── 9. Log-scaled length (compresses the heavy tail) ─────────────────
-        frames.append(np.log1p(texts.str.len()).rename("log_char_len"))
-
-        # ── Assemble ──────────────────────────────────────────────────────────
-        result = pd.concat(frames, axis=1).fillna(0).astype(float)
-        return result.values  # shape: (n_samples, n_scalar_features)
-
-    def get_feature_names_out(self) -> List[str]:
-        """Returns feature names for inspection / downstream use."""
-        dummy = pd.DataFrame({self.text_col: ["placeholder text."]})
-        n = self.transform(dummy).shape[1]
-        # Re-derive names by running on a 2-element frame (cheap)
-        df2 = pd.DataFrame({self.text_col: ["placeholder.", "second."]})
-        frames = []
-        texts = df2[self.text_col]
-        frames.append(texts.str.len().rename("char_len"))
-        # … (abbreviated; names match exactly the ones set above)
-        # For external tools, we expose a best-effort list:
-        names = [
-            "char_len", "word_count", "sentence_count", "words_per_sentence",
-            "type_token_ratio", "avg_word_len", "sent_len_std",
-            "punct_ratio", "comma_per_word", "exclamation_count", "question_count",
-            "allcaps_word_count", "uppercase_char_ratio",
-            "triple_consonant_count", "char_repeat_run_count", "alphanum_mix_count",
-            "ai_marker_count",
-        ] + [
-            f"marker_{re.sub(r'[^a-z_]', '', re.sub(r'\\b', '', p)).strip('_')}"
-            for p in self._AI_MARKERS
-        ] + ["digit_group_count", "log_char_len"]
-        return names[:n]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. PRETRAINED EMBEDDER (GloVe / Word2Vec via gensim.downloader)
-#
-#    WHY pretrained instead of training from scratch:
-#    On ~3k texts a from-scratch Word2Vec memorises corpus-specific noise
-#    rather than learning transferable semantics. A model pre-trained on
-#    billions of tokens (Wikipedia + Gigaword) carries genuine world knowledge
-#    that generalises far better to unseen test data.
-#
-#    Available models (set via CONFIG["glove_model_name"]):
-#      "glove-wiki-gigaword-50"   ->  50-dim,  ~70  MB  (fastest)
-#      "glove-wiki-gigaword-100"  -> 100-dim,  ~130 MB  <- default
-#      "glove-twitter-25"         ->  25-dim,  ~50  MB  (Twitter-domain)
-#      "word2vec-google-news-300" -> 300-dim,  ~1.6 GB  (high quality, heavy)
-#
-#    The model is downloaded ONCE and cached in ~/gensim-data.
-#    Subsequent runs load from cache instantly -- no re-download.
-# ══════════════════════════════════════════════════════════════════════════════
-
-class PretrainedEmbedder(BaseEstimator, TransformerMixin):
-    """
-    Document embedder via mean-pooling over a pretrained GloVe/W2V vocabulary.
-
-    Parameters
-    ----------
-    model_name : str
-        gensim.downloader key for the pretrained model.
-        Default ``"glove-wiki-gigaword-100"`` (100-dim, ~130 MB).
-    text_col : str
-        Name of the text column in the input DataFrame. Default ``"TEXT"``.
-    """
-
-    def __init__(
-        self,
-        model_name: str = "glove-wiki-gigaword-100",
-        text_col: str = "TEXT",
-    ) -> None:
-        self.model_name = model_name
-        self.text_col   = text_col
-
-        # Set after fit()
-        self._keyed_vectors = None   # gensim KeyedVectors object
-        self._vocab: set    = set()
-        self._vector_size: int = 0
-
-    # ── Helpers ────────────────────────────────────────────────────────────────────────────
-    @staticmethod
-    def _tokenize(series: pd.Series) -> List[List[str]]:
-        return [simple_preprocess(t) for t in series.fillna("").astype(str)]
-
-    def _doc_vector(self, tokens: List[str]) -> np.ndarray:
-        """Mean-pools pretrained vectors for all in-vocabulary tokens."""
-        valid = [t for t in tokens if t in self._vocab]
-        if valid:
-            return np.mean(self._keyed_vectors[valid], axis=0)
-        return np.zeros(self._vector_size)
-
-    # ── sklearn API ───────────────────────────────────────────────────────────────────────────
-    def fit(self, X: pd.DataFrame, y=None) -> "PretrainedEmbedder":
-        """
-        Loads the pretrained model from gensim cache (downloads on first call).
-        No training on X -- fit() is a data-independent load step.
-        """
-        if self._keyed_vectors is None:
-            print(f"[Embedder] Loading '{self.model_name}' via gensim.downloader...")
-            print(f"[Embedder] (First run downloads to ~/gensim-data; cached afterwards)")
-            self._keyed_vectors = gensim_dl.load(self.model_name)
-            self._vocab         = set(self._keyed_vectors.index_to_key)
-            self._vector_size   = self._keyed_vectors.vector_size
-            print(f"[Embedder] Loaded. Vocab: {len(self._vocab):,} tokens, dim={self._vector_size}")
-        return self
-
-    def transform(self, X: pd.DataFrame) -> np.ndarray:
-        if self._keyed_vectors is None:
-            raise RuntimeError("Call fit() before transform().")
-        tokenized = self._tokenize(X[self.text_col].fillna("").astype(str))
-        return np.vstack([self._doc_vector(toks) for toks in tokenized])
-
-    def get_feature_names_out(self) -> List[str]:
-        return [f"glove_{i}" for i in range(self._vector_size)]
+from utils.ScalarTextFeatureExtractor import ScalarTextFeatureExtractor
+from utils.PretrainedEmbedder import PretrainedEmbedder
+from utils.TfidfImpChiSelector import TfidfImpChiSelector
+from utils.TfidfCharSelector import TfidfCharSelector
 
 
 # Alias for backward compatibility
 Word2VecEmbedder = PretrainedEmbedder
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. TF-IDF + IMPCHI SELECTOR
-#    Improved Chi-squared (ImpCHI) feature selection:
-#    Instead of selecting the global top-K features (biased toward majority
-#    classes), we independently rank the top K features *per label* and take
-#    their union. This ensures minority-class vocabulary is not suppressed.
-#    Reference: Bahassine et al. (2018), J. King Saud Univ. - CIS.
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TfidfImpChiSelector(BaseEstimator, TransformerMixin):
-    """
-    TF-IDF vectorisation followed by per-label ImpCHI feature selection.
-
-    Parameters
-    ----------
-    k_per_label : int
-        Number of top features to retain *per class*. The final vocabulary is
-        the union of all per-class selections. Default 50.
-    min_df : int
-        Minimum document frequency for TF-IDF. Default 3.
-    ngram_range : tuple
-        N-gram range for TF-IDF. Default (1, 2).
-    text_col : str
-        Name of the text column in the input DataFrame. Default ``"TEXT"``.
-    """
-
-    def __init__(
-        self,
-        k_per_label: int = 50,
-        min_df: int = 3,
-        ngram_range: Tuple[int, int] = (1, 2),
-        text_col: str = "TEXT",
-    ) -> None:
-        self.k_per_label = k_per_label
-        self.min_df = min_df
-        self.ngram_range = ngram_range
-        self.text_col = text_col
-
-        # Set after fitting
-        self.tfidf_: Optional[TfidfVectorizer] = None
-        self.selected_indices_: List[int] = []
-        self.selected_names_: List[str] = []
-
-    # ── sklearn API ───────────────────────────────────────────────────────────
-    def fit(self, X: pd.DataFrame, y) -> "TfidfImpChiSelector":
-        texts = X[self.text_col].fillna("").astype(str)
-        y_arr = np.array(y)
-        unique_labels = np.unique(y_arr)
-
-        print(f"[ImpCHI] Fitting TF-IDF (min_df={self.min_df}, ngrams={self.ngram_range})…")
-        self.tfidf_ = TfidfVectorizer(
-            input="content",
-            encoding="utf-8",
-            lowercase=True,
-            stop_words="english",
-            min_df=self.min_df,
-            ngram_range=self.ngram_range,
-            sublinear_tf=True,  # log(1+tf) — compresses high-freq terms
-        )
-
-        X_tfidf = self.tfidf_.fit_transform(texts)
-        n_features = X_tfidf.shape[1]
-        print(f"[ImpCHI] Vocabulary size after TF-IDF: {n_features:,}")
-
-        # ── Per-label Chi2 selection (the ImpCHI step) ────────────────────────
-        feature_to_labels: dict = {}
-        k_safe = min(self.k_per_label, n_features)
-
-        for label in unique_labels:
-            y_binary = (y_arr == label).astype(int)
-            chi2_scores, _ = chi2(X_tfidf, y_binary)
-            chi2_scores = np.nan_to_num(chi2_scores)
-
-            top_indices = np.argsort(chi2_scores)[-k_safe:]
-            for idx in top_indices:
-                feature_to_labels.setdefault(idx, set()).add(label)
-
-        self.selected_indices_ = sorted(feature_to_labels.keys())
-
-        raw_names = self.tfidf_.get_feature_names_out()
-        self.selected_names_ = [
-            f"{raw_names[i]}_labels_{'_'.join(sorted(str(l) for l in feature_to_labels[i]))}"
-            for i in self.selected_indices_
-        ]
-        print(
-            f"[ImpCHI] Selected {len(self.selected_indices_):,} features "
-            f"(union of top-{k_safe} per label × {len(unique_labels)} classes)."
-        )
-        return self
-
-    def transform(self, X: pd.DataFrame) -> np.ndarray:
-        if self.tfidf_ is None:
-            raise RuntimeError("Call fit() before transform().")
-        texts = X[self.text_col].fillna("").astype(str)
-        X_full = self.tfidf_.transform(texts)
-        # Return dense slice — LightGBM handles it natively
-        return X_full[:, self.selected_indices_].toarray()
-
-    def get_feature_names_out(self) -> List[str]:
-        return self.selected_names_
-
-
+np.random.seed(42)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3b. TF-IDF CHAR N-GRAMS + IMPCHI SELECTOR
-#
-#    WHY char n-grams fight overfitting on small corpora:
-#    Character-level n-grams (e.g. "tion", " the", "ing ") are robust to
-#    unseen words and capture sub-word stylometric signals invisible to word
-#    tokenisers. They are particularly powerful here because:
-#      - AI text tends to have smoother, more predictable character transitions
-#      - Human typos create rare character sequences ("aboliished" -> "liish")
-#      - The same ImpCHI per-label selection preserves minority-class signals.
-#    Using analyzer='char_wb' pads tokens at word boundaries (e.g. " the ")
-#    which avoids cross-word n-grams and reduces noise.
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TfidfCharSelector(BaseEstimator, TransformerMixin):
-    """
-    Character-level TF-IDF with ImpCHI per-label feature selection.
-
-    Uses ``analyzer='char_wb'`` (word-boundary-padded character n-grams) to
-    extract sub-word stylometric signals, then applies the same ImpCHI
-    selection strategy as ``TfidfImpChiSelector``.
-
-    Parameters
-    ----------
-    k_per_label : int
-        Top char-ngrams to retain per class. Default 30.
-    min_df : int
-        Minimum document frequency for TF-IDF. Default 5.
-    ngram_range : tuple
-        Character n-gram range. Default (3, 5) -- tri- to 5-grams.
-    text_col : str
-        Name of the text column in the input DataFrame. Default ``"TEXT"``.
-    """
-
-    def __init__(
-        self,
-        k_per_label: int = 30,
-        min_df: int = 5,
-        ngram_range: Tuple[int, int] = (3, 5),
-        text_col: str = "TEXT",
-    ) -> None:
-        self.k_per_label = k_per_label
-        self.min_df      = min_df
-        self.ngram_range = ngram_range
-        self.text_col    = text_col
-
-        self.tfidf_: Optional[TfidfVectorizer] = None
-        self.selected_indices_: List[int] = []
-        self.selected_names_: List[str] = []
-
-    def fit(self, X: pd.DataFrame, y) -> "TfidfCharSelector":
-        texts = X[self.text_col].fillna("").astype(str)
-        y_arr = np.array(y)
-        unique_labels = np.unique(y_arr)
-
-        print(f"[CharImpCHI] Fitting char TF-IDF "
-              f"(min_df={self.min_df}, ngrams={self.ngram_range})...")
-        self.tfidf_ = TfidfVectorizer(
-            analyzer="char_wb",          # word-boundary-padded char n-grams
-            ngram_range=self.ngram_range,
-            min_df=self.min_df,
-            sublinear_tf=True,
-            lowercase=True,
-        )
-        X_tfidf = self.tfidf_.fit_transform(texts)
-        n_features = X_tfidf.shape[1]
-        print(f"[CharImpCHI] Char vocab size: {n_features:,}")
-
-        # ── ImpCHI: per-label top-K selection (same logic as TfidfImpChiSelector) ────
-        feature_to_labels: dict = {}
-        k_safe = min(self.k_per_label, n_features)
-
-        for label in unique_labels:
-            y_binary = (y_arr == label).astype(int)
-            chi2_scores, _ = chi2(X_tfidf, y_binary)
-            chi2_scores = np.nan_to_num(chi2_scores)
-            for idx in np.argsort(chi2_scores)[-k_safe:]:
-                feature_to_labels.setdefault(idx, set()).add(label)
-
-        self.selected_indices_ = sorted(feature_to_labels.keys())
-        raw_names = self.tfidf_.get_feature_names_out()
-        self.selected_names_ = [
-            f"char_{raw_names[i].strip()}_lbl_{'_'.join(sorted(str(l) for l in feature_to_labels[i]))}"
-            for i in self.selected_indices_
-        ]
-        print(f"[CharImpCHI] Selected {len(self.selected_indices_):,} char features "
-              f"(top-{k_safe} per label x {len(unique_labels)} classes).")
-        return self
-
-    def transform(self, X: pd.DataFrame) -> np.ndarray:
-        if self.tfidf_ is None:
-            raise RuntimeError("Call fit() before transform().")
-        texts = X[self.text_col].fillna("").astype(str)
-        X_full = self.tfidf_.transform(texts)
-        return X_full[:, self.selected_indices_].toarray()
-
-    def get_feature_names_out(self) -> List[str]:
-        return self.selected_names_
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. DATAFRAME → ARRAY ADAPTER
+# 1. DATAFRAME → ARRAY ADAPTER
 #    sklearn's FeatureUnion requires all components to accept the same input
 #    and return arrays. This thin wrapper ensures DataFrames flow correctly.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -566,7 +83,7 @@ class _PassThroughAdapter(BaseEstimator, TransformerMixin):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. FULL PIPELINE FACTORY
+# 2. FULL PIPELINE FACTORY
 #    Combines the three feature groups via FeatureUnion, then feeds the
 #    concatenated matrix to LightGBM.
 #
@@ -667,10 +184,7 @@ def build_pipeline(
     return Pipeline(steps=[("features", feature_union), ("clf", classifier)])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6. EXPERIMENT CONFIGURATION
-#    ┌─────────────────────────────────────────────────────────────────────┐
-#    │  Change anything here — the rest of the code adapts automatically.  │
-#    └─────────────────────────────────────────────────────────────────────┘
+# 3. CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 CONFIG = {
@@ -703,9 +217,9 @@ CONFIG = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. MODEL REGISTRY
+# 4. MODEL REGISTRY
 # ══════════════════════════════════════════════════════════════════════════════
-# 7. MODEL REGISTRY
+# 4. MODEL REGISTRY
 #    To add a model: write a _make_<name>(params, num_classes) factory
 #    and add it to MODEL_REGISTRY + SEARCH_SPACES.
 # ══════════════════════════════════════════════════════════════════════════════
@@ -813,9 +327,9 @@ MODEL_REGISTRY = {
 }
 
 
-# 8. OPTUNA SEARCH SPACES
+# 5. OPTUNA SEARCH SPACES
 # ══════════════════════════════════════════════════════════════════════════════
-# 8. OPTUNA SEARCH SPACES
+# 5. OPTUNA SEARCH SPACES
 #
 #    REGULARISATION PHILOSOPHY for ~2.4k train samples:
 #      max_depth  ∈ {3,4,5}      — very shallow trees, no room to memorise
@@ -918,7 +432,7 @@ def _suggest_preprocessor(trial) -> dict:
     }
 
 
-# 9. BAYESIAN TUNING ENGINE
+# 6. BAYESIAN TUNING ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_bayesian_tuning(
@@ -1092,7 +606,7 @@ def run_bayesian_tuning(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
-# 10. MAIN — Orchestrates everything
+# 7. MAIN — Orchestrates everything
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Pseudo-labeling configuration ─────────────────────────────────────────────

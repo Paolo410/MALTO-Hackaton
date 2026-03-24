@@ -22,7 +22,7 @@ Class 5 (AI):      320 samples  ████████████████
 
 ## Architecture
 
-The pipeline is built entirely with scikit-learn primitives, making it serialisable, reproducible, and easy to audit. Four feature streams are combined via `FeatureUnion` and fed to a soft-voting ensemble.
+The pipeline is built entirely with scikit-learn primitives, making it serialisable, reproducible, and easy to audit. Four feature streams are combined via `FeatureUnion` and fed to a LightGBM classifier.
 
 ```
 Raw text (single TEXT column)
@@ -39,10 +39,8 @@ Raw text (single TEXT column)
                                               │
                                      ~373 dense features
                                               │
-                                    VotingClassifier (soft)
-                                    ┌─────────┬──────────┐
-                                  LGBM    XGBoost    LinearSVC
-                                                    (calibrated)
+                                    LGBMClassifier
+                                  (class_weight='balanced')
                                               │
                                       Final prediction
 ```
@@ -91,17 +89,19 @@ The same ImpCHI selection applied to character n-grams (3–5-grams) with `analy
 
 ---
 
-## Model: Soft-Voting Ensemble
+## Classifier: LightGBM
 
-Three structurally diverse classifiers are combined via `VotingClassifier(voting='soft')`, which averages their predicted class probabilities rather than taking a majority vote. This produces softer, better-calibrated decision boundaries.
+A single `LGBMClassifier` with `class_weight='balanced'` to compensate for the 20:1 class imbalance. Parameters are deliberately conservative to prevent memorisation on a 2,400-sample corpus:
 
-| Member | Role |
-|---|---|
-| `LGBMClassifier` | Strong on non-linear interactions in dense features (embeddings, scalar) |
-| `XGBClassifier` | Independent boosting implementation; errors weakly correlated with LGBM |
-| `CalibratedClassifierCV(LinearSVC)` | Linear model; near-zero overfitting on sparse TF-IDF; acts as a regularising anchor |
+| Parameter | Value | Rationale |
+|---|---|---|
+| `max_depth` | 3–5 (tuned) | Very shallow trees, no room to memorise |
+| `num_leaves` | 10–20 (tuned) | Far below sklearn default of 31 |
+| `min_child_samples` | 20–60 (tuned) | Forces large, generalisable leaves |
+| `reg_alpha` | 0.1–1.0 | L1 regularisation |
+| `reg_lambda` | 1.0–10.0 | L2 regularisation |
 
-All three use `class_weight='balanced'` to compensate for the 20:1 class imbalance. Tree parameters are deliberately conservative (`max_depth ≤ 5`, `num_leaves ≤ 20`, high `min_child_samples`) to prevent memorisation on a 2,400-sample corpus.
+The pipeline also registers `"random_forest"`, `"linear_svc"`, `"xgboost"` and `"ensemble"` in the `MODEL_REGISTRY` — switching is one line in `CONFIG`.
 
 ---
 
@@ -125,7 +125,7 @@ The GloVe embedder is **frozen** before the Optuna loop starts and shared across
 
 ## Pseudo-Labeling
 
-After training on the full labelled set, the ensemble's `predict_proba` is run on the 600 unlabelled test samples. Any sample with a maximum class probability ≥ 0.90 is assigned its predicted label as a **pseudo-label** and added to the training set.
+After training on the full labelled set, `predict_proba` is run on the 600 unlabelled test samples. Any sample with a maximum class probability ≥ 0.90 is assigned its predicted label as a **pseudo-label** and added to the training set.
 
 A fresh pipeline is then retrained from scratch on this augmented dataset (TF-IDF and ImpCHI re-fitted on the larger corpus). This is safe at high thresholds: empirically, over 90% of pseudo-labels at 0.90 confidence are correct.
 
@@ -141,6 +141,21 @@ A fresh pipeline is then retrained from scratch on this augmented dataset (TF-ID
 
 ---
 
+## Post-competition improvements
+
+After the competition closed, two further changes were tested:
+
+**Soft-voting ensemble** (`active_model = "ensemble"`): replacing the single LightGBM with a `VotingClassifier(voting='soft')` combining LGBM + XGBoost + CalibratedLinearSVC. The three members fail on different examples (trees struggle on sparse TF-IDF; LinearSVC excels there), so their averaged probabilities are better calibrated than any individual model.
+
+**Sentence Transformer embeddings**: replacing GloVe mean-pooling with `all-MiniLM-L6-v2` from `sentence-transformers`. Unlike GloVe (static per-word vectors), MiniLM encodes the full sentence context — distinguishing `"Furthermore, this demonstrates..."` from a human typo with the same tokens. The model is frozen during inference (no fine-tuning), so it adds zero variance despite its 22M parameters.
+
+| Version | Embedding | Active model | Macro F1 |
+|---|---|---|---|
+| Competition submission | GloVe 100-dim | `lgbm` | **0.916** |
+| Post-competition | Sentence Transformer MiniLM | `ensemble` | **0.925** |
+
+---
+
 ## Repository Structure
 
 ```
@@ -148,7 +163,7 @@ A fresh pipeline is then retrained from scratch on this augmented dataset (TF-ID
 ├── dataset/
 │   ├── train.csv        # 2,400 labelled samples (TEXT, LABEL)
 │   └── test.csv         # 600 unlabelled samples (TEXT)
-├── submission.csv       # Final predictions
+├── submission.csv       # Final predictions (0.916)
 └── README.md
 ```
 
@@ -157,22 +172,23 @@ A fresh pipeline is then retrained from scratch on this augmented dataset (TF-ID
 ## Quickstart
 
 ```bash
-pip install lightgbm xgboost scikit-learn optuna gensim sentence-transformers pandas numpy
+pip install lightgbm xgboost scikit-learn optuna gensim pandas numpy
 python pipeline.py
 ```
 
 The script trains the full pipeline, prints a classification report on the hold-out set, applies pseudo-labeling, and writes `submission.csv`.
 
-To change the active model or threshold, edit the `CONFIG` dict at the top of the script:
+Key settings in `CONFIG` and at the top of the script:
 
 ```python
 CONFIG = {
-    "active_model": "ensemble",        # "lgbm" | "xgboost" | "linear_svc" | "ensemble"
-    "n_trials": 7,                     # Optuna trials
+    "active_model": "lgbm",    # "lgbm" | "xgboost" | "linear_svc" | "ensemble"
+    "n_trials": 7,             # Optuna trials (increase for better tuning)
     "cv_folds": 5,
+    "glove_model_name": "glove-wiki-gigaword-100",
     ...
 }
-PSEUDO_LABEL_THRESHOLD = 0.90          # set to 1.01 to disable pseudo-labeling
+PSEUDO_LABEL_THRESHOLD = 0.90  # set to 1.01 to disable pseudo-labeling
 ```
 
 ---
@@ -185,7 +201,6 @@ xgboost>=1.7
 scikit-learn>=1.3
 optuna>=3.0
 gensim>=4.3
-sentence-transformers>=2.2
 pandas>=2.0
 numpy>=1.24
 ```
@@ -194,11 +209,10 @@ numpy>=1.24
 
 ## Key Design Decisions for the Interview
 
-**Why not a fine-tuned BERT end-to-end?** With only 2,400 samples, fine-tuning a full transformer risks catastrophic overfitting. Using frozen pretrained embeddings as features for a gradient-boosted ensemble extracts the semantic power of transformers while keeping the learnable parameter count minimal.
+**Why not a fine-tuned BERT end-to-end?** With only 2,400 samples, fine-tuning a full transformer risks catastrophic overfitting. Using frozen pretrained embeddings as features for a gradient-boosted classifier extracts the semantic power of transformers while keeping the learnable parameter count minimal.
 
 **Why ImpCHI instead of standard Chi-squared?** On imbalanced data, global Chi-squared selects features that discriminate the majority class — here, human text. ImpCHI independently selects the top features *per class*, guaranteeing that rare AI variants (80 samples) have their distinctive vocabulary represented in the final feature space.
 
-**Why an ensemble over a single model?** The three members fail on different examples. LGBM struggles with very sparse TF-IDF spaces; LinearSVC excels there. Their error correlation is low, so their soft probability average is better calibrated than any individual model.
-
 **Why pseudo-labeling?** The test set is 600 samples — 25% of the training set size. High-confidence pseudo-labels at ≥0.90 threshold add effectively noise-free signal and expand the vocabulary seen by TF-IDF, improving generalisation at negligible cost.
-# MALTO-Hackaton
+
+**Why character n-grams alongside word n-grams?** Word tokenisers miss sub-word patterns. A character trigram like `"iis"` or `"liis"` is a direct fingerprint of human typing errors; the AI-marker trigram `"rmo"` (from `furthermore`) is invisible at the word level. The two feature spaces are complementary and their union is more robust than either alone.
