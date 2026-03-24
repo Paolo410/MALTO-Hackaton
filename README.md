@@ -154,7 +154,7 @@ A fresh pipeline is then retrained from scratch on this augmented dataset (TF-ID
 │   ├── TfidfCharSelector.py
 │   ├── TfidfImpChiSelector.py        
 ├── submission.csv       # Final predictions (0.916)
-├── main.csv
+├── main.py
 └── README.md
 ```
 
